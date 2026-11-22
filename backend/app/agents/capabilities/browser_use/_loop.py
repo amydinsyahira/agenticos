@@ -364,8 +364,10 @@ async def _drive(
     )
 
     async with (
-        Preview(page, emit, call_id, lambda: session.steps) if policy.preview else nullcontext()
-    ) as preview:
+        Preview(page, emit, call_id, lambda: session.steps)
+        if policy.preview
+        else nullcontext() as preview
+    ):
         recent: list[str] = []
         for taken in range(1, policy.max_steps + 1):
             previews_land = preview.watching if preview is not None else False
@@ -566,10 +568,7 @@ async def _drive(
             signature = _signature(snapshot, step)
             recent.append(signature)
             if recent[-REPEAT_LIMIT:].count(signature) == REPEAT_LIMIT:
-                reason = (
-                    f"The same action was chosen {REPEAT_LIMIT} times running without "
-                    f"changing the page."
-                )
+                reason = f"The same action was chosen {REPEAT_LIMIT} times running without changing the page."
                 return await _finish(
                     emit,
                     session,
@@ -827,14 +826,40 @@ async def held(
                         detail=str(refused),
                     )
                 )
-            await anyio.sleep(1.0 if page.streaming or not watching else 0.2)
+            # A sign-in or human takeover needs a responsive viewport but not
+            # five full JPEG screenshots and DOM location reads every second.
+            # Limit the screenshot fallback to two frames/second; pages using
+            # CDP screencast retain their existing paint-driven cadence.
+            await anyio.sleep(1.0 if page.streaming or not watching else 0.5)
+
+    async def streamed_pictures() -> None:
+        # Native CDP screencast is push-based: Chromium sends an image when the
+        # page paints. The existing Preview only starts it while a permitted
+        # viewer is watching, unlike polling Page.captureScreenshot forever.
+        # Older/test browser pages may lack streaming; preserve the fallback.
+        if not callable(getattr(page, "stream", None)):
+            await pictures()
+            return
+        try:
+            async with Preview(page, emit, call_id, lambda: session.steps):
+                await anyio.sleep_forever()
+        except Exception as exc:
+            # A preview is optional. If CDP refuses to start a screencast,
+            # keep manual clicks and the original screenshot fallback alive.
+            logfire.info(
+                "browser live screencast unavailable; switching to screenshot fallback",
+                error_type=type(exc).__name__,
+            )
+            await pictures()
 
     async with anyio.create_task_group() as tasks:
-        tasks.start_soon(pictures)
+        tasks.start_soon(streamed_pictures)
         try:
             with anyio.move_on_after(HOLD_LIMIT):
+                pending: BrowserCommand | None = None
                 while True:
-                    command = await control.wait(FRAME_EVERY)
+                    command = pending if pending is not None else await control.wait(FRAME_EVERY)
+                    pending = None
                     if command is None or (
                         by_user_id is not None and command.by_user_id != by_user_id
                     ):
@@ -844,6 +869,22 @@ async def held(
                             kept = await remember(page, command)
                         break
                     try:
+                        if command.type == "scroll" and command.dy is not None:
+                            # Trackpads enqueue many small deltas. Combine only
+                            # consecutive authorized scrolls; a click or hand-back
+                            # stays next in order instead of being lost or delayed.
+                            dy = command.dy
+                            for _ in range(31):
+                                queued = await control.poll()
+                                if queued is None:
+                                    break
+                                if by_user_id is not None and queued.by_user_id != by_user_id:
+                                    continue
+                                if queued.type != "scroll" or queued.dy is None:
+                                    pending = queued
+                                    break
+                                dy += queued.dy
+                            command = command.model_copy(update={"dy": dy})
                         await _person_input(page, command)
                         if command.type in {"navigate", "back", "forward", "reload"}:
                             url, title = await page.location()

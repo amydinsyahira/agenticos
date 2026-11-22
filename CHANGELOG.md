@@ -19,6 +19,12 @@ Two things are versioned separately from this file and worth knowing about:
 
 ## [Unreleased]
 
+### Fixed
+
+- Map manual Live Browser clicks using the delivered image dimensions, so buttons remain clickable on high-density displays with CDP screencast and screenshot fallback.
+- Combine consecutive trackpad scroll commands while preserving clicks, hand-back order and the current holder's input boundary.
+- Show personal Sign-ins sessions immediately, start navigation without waiting for a full DOM snapshot, and use viewer-aware screencast with a screenshot fallback.
+
 ## [1.89.1] - 2026-11-22
 
 ### Fixed

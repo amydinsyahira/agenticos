@@ -1048,7 +1048,12 @@ class TestAPersonTakesTheBrowserOver:
         result, session = await _watched(page, _decider(DONE, seen=seen), control, frames)
 
         assert result.outcome == "done"
-        assert page.done == ["click_at:10,20", "insert:hunter2", "press:Enter", "wheel:-300"]
+        assert [action for action in page.done if not action.startswith("stream:")] == [
+            "click_at:10,20",
+            "insert:hunter2",
+            "press:Enter",
+            "wheel:-300",
+        ]
         assert frames.of("browser_held")[0].by == "Ada"
         assert len(frames.of("browser_released")) == 1
         # Input never waits for a screenshot per keystroke.
@@ -1071,7 +1076,7 @@ class TestAPersonTakesTheBrowserOver:
             polled=TAKE,
         )
         await _watched(page, _decider(DONE), control, _Frames())
-        assert page.done == []
+        assert [action for action in page.done if not action.startswith("stream:")] == []
 
     async def test_anything_but_a_take_over_between_steps_is_ignored(self):
         frames = _Frames()
@@ -1082,7 +1087,9 @@ class TestAPersonTakesTheBrowserOver:
         page = _FakePage()
         control = _Control(BrowserCommand(type="resize", width=640, height=900), GIVE, polled=TAKE)
         await _watched(page, _decider(DONE), control, _Frames())
-        assert page.done == ["resize:640x900@1"]
+        assert [action for action in page.done if not action.startswith("stream:")] == [
+            "resize:640x900@1"
+        ]
 
     async def test_a_person_who_walks_away_has_the_tab_taken_back(self, quick: None):
         frames = _Frames()
@@ -1132,7 +1139,9 @@ class TestThePageIsTheSizeOfTheWindowWatchingIt:
 
         await _watched(page, _decider(DONE), control, frames)
 
-        assert page.done == ["resize:700x700@1"]
+        assert [action for action in page.done if not action.startswith("stream:")] == [
+            "resize:700x700@1"
+        ]
         assert frames.of("browser_held")[0].by == "Ada"
 
     async def test_the_first_step_waits_for_the_window_that_opened_with_it(
@@ -1303,6 +1312,38 @@ class TestOnlyTheHolderDrives:
         assert events[0].kind == "browser_held" and events[0].by_user_id == "u-ada"
 
 
+async def test_a_held_person_uses_cdp_screencast_instead_of_polling_jpegs() -> None:
+    """Live Sign-ins should use the viewer-aware paint stream; never poll screenshots."""
+    page = _FakePage(painted=("data:image/jpeg;base64,QUJD",))
+    events: list[BrowserEvent] = []
+    painted = anyio.Event()
+
+    async def emit(event: BrowserEvent) -> bool:
+        events.append(event)
+        if event.image:
+            painted.set()
+        return True
+
+    class ControlAfterStream:
+        async def wait(self, timeout: float) -> BrowserCommand:
+            with anyio.fail_after(3):
+                await painted.wait()
+            return BrowserCommand(type="give_back", remember=False, by_user_id="u-ada")
+
+    await _loop.held(
+        BrowseSession(page=page),
+        ControlAfterStream(),
+        emit,
+        call_id="preview-test",
+        by="Ada",
+        by_user_id="u-ada",
+        remember=None,
+    )
+    assert "stream:on" in page.done and "stream:off" in page.done
+    assert page.shots == 0, "screencast should eliminate repeated Page.captureScreenshot"
+    assert any(event.kind == "browser_frame" and event.image for event in events)
+
+
 class TestAPersonKeepsTheirSignIn:
     """#2129: handing the browser back can keep the sign-in made while holding it."""
 
@@ -1373,7 +1414,9 @@ class TestTheAgentAsksForAPerson:
         result, _ = await _watched(page, _decider(ASK, DONE, seen=seen), control, frames)
 
         assert result.outcome == "done"
-        assert page.done == ["insert:agent"]
+        assert [action for action in page.done if not action.startswith("stream:")] == [
+            "insert:agent"
+        ]
         assert frames.of("browser_held")[0].by == "Ada"
         [_, (_, history, _, _)] = seen
         assert history[-2] == "step 1: a step - asked a person"

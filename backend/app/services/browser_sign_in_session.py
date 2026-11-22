@@ -12,6 +12,7 @@ the person who started it may watch it, because its pictures are them typing a
 password.
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import NamedTuple
@@ -138,6 +139,14 @@ async def begin(ctx: AuthContext, url: str, *, holder: str) -> SignInSession:
             started_at=datetime.now(UTC),
         ),
     )
+    # The live viewer must have an opening frame even when Chromium is slow or
+    # fails before navigation. The reducer cannot display a terminal failure for
+    # a browse that has never received browser_opened.
+    await live_browse.publish(
+        run_id,
+        CALL_ID,
+        BrowserEvent(kind="browser_opened", call_id=CALL_ID, step=0, url=url, run_id=run_id),
+    )
     spawn(
         drive(ctx.organization_id, user_id, run_id, url, holder),
         name="browser_sign_in_session",
@@ -156,6 +165,11 @@ async def drive(organization_id: UUID, user_id: UUID, run_id: str, url: str, hol
 
     async def emit(event: BrowserEvent) -> bool:
         await live_browse.publish(run_id, CALL_ID, event)
+        # Do not keep capturing JPEGs for a sign-in view that nobody is
+        # watching. The live browse socket subscribes to the viewers channel;
+        # a reconnect is discovered by the next location poll.
+        if event.kind == "browser_frame":
+            return await live_browse.has_viewers(run_id, CALL_ID)
         return True
 
     # Only the person's own give-back reaches this: `hand_over` drops every
@@ -172,39 +186,61 @@ async def drive(organization_id: UUID, user_id: UUID, run_id: str, url: str, hol
         try:
             validate_cdp_url(WebBrowserConfig(cdp_url=cdp_url))
             sign_ins = await browser_sign_in.load_for(organization_id, user_id)
-            async with open_page(
-                cdp_url=cdp_url, start_url=url, policy=_POLICY, sign_ins=sign_ins
-            ) as page:
-                snapshot = await page.snapshot()
-                await emit(
-                    BrowserEvent(
-                        kind="browser_opened",
-                        call_id=CALL_ID,
-                        step=0,
-                        url=snapshot.url,
-                        title=snapshot.title,
-                        run_id=run_id,
+            for attempt in range(2):
+                handed_off = False
+                try:
+                    async with open_page(
+                        cdp_url=cdp_url,
+                        start_url=url,
+                        policy=_POLICY,
+                        sign_ins=sign_ins,
+                        quick_start=True,
+                    ) as page:
+                        # The person can interact as soon as navigation is dispatched.
+                        # Polling location here can block for the full CDP timeout on
+                        # Instagram's login/2FA redirects. The screencast updates the
+                        # actual location and title asynchronously after the first paint.
+                        await emit(
+                            BrowserEvent(
+                                kind="browser_opened",
+                                call_id=CALL_ID,
+                                step=0,
+                                url=url,
+                                title=urlsplit(url).hostname or "",
+                                run_id=run_id,
+                            )
+                        )
+                        handed_off = True
+                        await hand_over(
+                            BrowseSession(page=page),
+                            control,
+                            emit,
+                            call_id=CALL_ID,
+                            by=holder,
+                            by_user_id=str(user_id),
+                            remember=keep,
+                        )
+                        await emit(
+                            BrowserEvent(kind="browser_finished", call_id=CALL_ID, step=0, outcome="done")
+                        )
+                    break
+                except (httpx.HTTPError, OSError, EndpointError, RuntimeError) as exc:
+                    if attempt != 0 or handed_off:
+                        raise
+                    # Retry a connection/initial navigation failure once with
+                    # a fresh isolated Chromium context. Never retry once the
+                    # person can interact, to avoid losing their login form.
+                    logger.warning(
+                        "browser_sign_in_start_retry error_type=%s", type(exc).__name__
                     )
-                )
-                await hand_over(
-                    BrowseSession(page=page),
-                    control,
-                    emit,
-                    call_id=CALL_ID,
-                    by=holder,
-                    by_user_id=str(user_id),
-                    remember=keep,
-                )
-                await emit(
-                    BrowserEvent(kind="browser_finished", call_id=CALL_ID, step=0, outcome="done")
-                )
+                    await asyncio.sleep(0.5)
         except (httpx.HTTPError, OSError, EndpointError, UrlRefusedError, RuntimeError) as exc:
             # The host only: an endpoint URL can carry a token. A plain
             # RuntimeError is also what the CDP client raises for a page that went
             # away, but it can be a defect here too, so it keeps its traceback.
             logger.warning(
-                "browser_sign_in_unavailable",
-                extra={"host": urlsplit(cdp_url).hostname, "error": type(exc).__name__},
+                "browser_sign_in_unavailable error_type=%s", type(exc).__name__,
+                extra={"host": urlsplit(cdp_url).hostname},
                 exc_info=type(exc) is RuntimeError,
             )
             await emit(
