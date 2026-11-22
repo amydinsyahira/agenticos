@@ -18,6 +18,7 @@ import pytest
 from app.agents.browser_events import BrowserCommand, BrowserEvent
 from app.agents.browser_sign_ins import SignIn
 from app.agents.capabilities.browser_use._elements import Snapshot
+from app.agents.capabilities.browser_use._endpoint import EndpointError
 from app.api.routes.v1.browser_sign_ins import sign_in_browser, sign_in_to_a_site
 from app.core.config import settings
 from app.core.exceptions import (
@@ -119,6 +120,15 @@ class TestBeginning:
         assert meta.personal and meta.remembers
         assert (meta.user_id, meta.agent_id) == (str(PERSON), None)
         assert meta.task == "Sign in to www.notion.so"
+        # An opening frame is visible before slow Chromium navigation finishes;
+        # if startup fails, the UI can now render browser_finished instead of
+        # remaining an empty loading skeleton forever.
+        [opened_event] = deployment["published"]
+        assert (opened_event.kind, opened_event.run_id, opened_event.url) == (
+            "browser_opened",
+            run_id,
+            "https://www.notion.so/login",
+        )
         assert deployment["spawned"] == ["browser_sign_in_session"]
 
     async def test_an_api_key_has_no_session_to_keep(self, deployment: dict[str, Any]) -> None:
@@ -231,6 +241,7 @@ class _Control:
 def _browser(page: _Page) -> Any:
     @asynccontextmanager
     async def open_page(**kwargs: Any) -> AsyncIterator[_Page]:
+        page.open_kwargs = kwargs
         yield page
 
     return open_page
@@ -280,6 +291,20 @@ class TestDriving:
         # The person's place is given back when the browser closes.
         assert deployment["released"] == [(f"browser-sign-in:{PERSON}", "sign-in-1")]
 
+    async def test_sign_in_does_not_collect_the_heavy_page_dom(
+        self, deployment: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _Page()
+
+        async def expensive_snapshot() -> Snapshot:
+            raise AssertionError("sign-in must not collect DOM snapshot")
+
+        page.snapshot = expensive_snapshot  # type: ignore[method-assign]
+        await self._drive(monkeypatch, page, _give_back())
+        assert deployment["published"][0].kind == "browser_opened"
+        assert page.open_kwargs["quick_start"] is True
+        assert deployment["published"][-1].outcome == "done"
+
     async def test_nobody_but_the_person_drives_or_hands_it_back(
         self, deployment: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -328,9 +353,43 @@ class TestDriving:
                 ORG, PERSON, "sign-in-1", "https://www.notion.so/login", "Ada Lovelace"
             )
 
-        [record] = [r for r in caplog.records if r.getMessage() == "browser_sign_in_unavailable"]
+        [record] = [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("browser_sign_in_unavailable error_type=")
+        ]
         assert record.exc_info is not None
         assert deployment["published"][-1].outcome == "failed"
+
+    async def test_one_transient_cdp_startup_failure_is_retried(
+        self, deployment: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        attempts = 0
+        page = _Page()
+
+        @asynccontextmanager
+        async def flaky_open(**kwargs: Any) -> AsyncIterator[_Page]:
+            nonlocal attempts
+            attempts += 1
+            assert kwargs["quick_start"] is True
+            if attempts == 1:
+                raise EndpointError("CDP startup stalled")
+            yield page
+
+        monkeypatch.setattr(session_module.browser_sign_in, "load_for", AsyncMock(return_value=[]))
+        monkeypatch.setattr(session_module.browser_sign_in, "remember", AsyncMock())
+        monkeypatch.setattr(session_module, "open_page", flaky_open)
+        monkeypatch.setattr(
+            session_module.live_browse,
+            "LiveControl",
+            MagicMock(return_value=_Control(_give_back())),
+        )
+        monkeypatch.setattr(session_module.asyncio, "sleep", AsyncMock())
+        await session_module.drive(
+            ORG, PERSON, "sign-in-1", "https://www.notion.so/login", "Ada Lovelace"
+        )
+        assert attempts == 2
+        assert deployment["published"][-1].outcome == "done"
 
     async def test_a_browser_that_does_not_answer_ends_the_view_with_the_reason(
         self, deployment: dict[str, Any], monkeypatch: pytest.MonkeyPatch

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from tests.test_browser_use import GIVE, TAKE, _Control, _FakePage, _Frames
 
 from app.agents.browser_events import BrowserCommand
 from app.agents.capabilities.browser_use import _loop
@@ -19,7 +20,6 @@ from app.agents.capabilities.browser_use._page import (
     StaleElement,
 )
 from app.agents.capabilities.browser_use._toolset import BrowserToolset
-from tests.test_browser_use import GIVE, TAKE, _Control, _FakePage, _Frames
 
 pytestmark = pytest.mark.anyio
 
@@ -199,6 +199,8 @@ async def test_typing_is_not_blocked_by_slow_capture(monkeypatch: pytest.MonkeyP
     async def insert(text: str) -> None:
         typed.set()
 
+    # Exercise the screenshot fallback when this page has no paint stream.
+    monkeypatch.setattr(target, "stream", None)
     monkeypatch.setattr(target, "screenshot", screenshot)
     monkeypatch.setattr(target, "insert_text", insert)
 
@@ -253,7 +255,12 @@ async def test_navigation_only_applies_while_held() -> None:
         by_user_id=None,
         remember=None,
     )
-    assert target.done == ["back", "forward", "reload", "navigate:https://example.test/"]
+    assert [action for action in target.done if not action.startswith("stream:")] == [
+        "back",
+        "forward",
+        "reload",
+        "navigate:https://example.test/",
+    ]
     await _loop.between_steps(target, _Control(polled=BrowserCommand(type="reload")))
     assert target.done.count("reload") == 1
 
@@ -447,6 +454,8 @@ async def test_metadata_updates_are_not_repeated_for_an_unchanged_page(
             checked_twice.set()
         return "https://example.test/", "Example"
 
+    # Exercise the screenshot fallback when this page has no paint stream.
+    monkeypatch.setattr(target, "stream", None)
     monkeypatch.setattr(target, "location", location)
 
     class Control:
@@ -544,8 +553,9 @@ async def test_reading_an_existing_tab_without_a_direct_view_does_not_start_a_pr
 
 @pytest.mark.parametrize("resize", [False, True])
 async def test_interrupted_replay_does_not_skip_to_the_next_cached_action(resize: bool) -> None:
-    from app.agents.capabilities.browser_use._plans import PlanStep
     from tests.test_browser_use import DONE, _element, _policy, _snapshot
+
+    from app.agents.capabilities.browser_use._plans import PlanStep
 
     target = _FakePage(_snapshot(_element(0, label="First"), _element(1, label="Second")))
 
@@ -584,8 +594,9 @@ async def test_interrupted_replay_does_not_skip_to_the_next_cached_action(resize
 async def test_closing_a_failed_page_keeps_its_last_confirmed_location(
     failure: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from app.agents.capabilities.browser_use._direct import close_view
     from tests.test_browser_use import _snapshot
+
+    from app.agents.capabilities.browser_use._direct import close_view
 
     page, frames = _FakePage(), _Frames()
     monkeypatch.setattr(page, "location", AsyncMock(side_effect=failure))
@@ -665,6 +676,8 @@ async def test_held_preview_recovers_after_a_temporary_metadata_failure(
             await recovered.wait()
             return GIVE
 
+    # Exercise the screenshot fallback when this page has no paint stream.
+    monkeypatch.setattr(target, "stream", None)
     monkeypatch.setattr(target, "location", location)
     with anyio.fail_after(2):
         await held(

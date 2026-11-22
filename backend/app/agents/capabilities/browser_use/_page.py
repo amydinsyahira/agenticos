@@ -17,12 +17,15 @@ import asyncio
 import ipaddress
 import json
 import logging
+from base64 import b64decode
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any
 from urllib.parse import urlsplit
 
+from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agents.browser_sign_ins import (
@@ -88,10 +91,8 @@ logger = logging.getLogger(__name__)
 
 _EVAL_BACKOFF = 0.25
 
-STREAM_GAP = 0.08
-"""Seconds between two streamed frames: about twelve a second, smooth to a reader
-and a tenth of what the browser can paint, so a page animating at sixty frames a
-second does not become sixty JPEGs a second over the socket."""
+STREAM_GAP = 0.15
+"""Minimum gap between streamed frames, limiting an animating page to about seven per second."""
 
 FRAME_QUALITY = 80
 """JPEG quality of the frames a person watches and the screenshots a step takes.
@@ -601,10 +602,7 @@ def parse_snapshot(raw: object, cap: int) -> Snapshot:
     )
 
 
-_STORAGE_JS = (
-    "(() => { try { return JSON.stringify(Object.entries(localStorage)); }"
-    " catch (e) { return '[]'; } })()"
-)
+_STORAGE_JS = "(() => { try { return JSON.stringify(Object.entries(localStorage)); } catch (e) { return '[]'; } })()"
 """The origin's `localStorage` as JSON pairs - or none, where the page forbids it."""
 
 
@@ -690,6 +688,7 @@ class CdpPage:
         self._width = policy.preview_width
         self._height = round(policy.preview_width * _VIEWPORT_RATIO)
         self._scale = 1
+        self._picture_scale = (1.0, 1.0)
         self._streaming = False
 
     async def _evaluate(  # pragma: no cover - needs a live browser
@@ -773,8 +772,7 @@ class CdpPage:
         check_navigation(snapshot.url)
         if not domain_allowed(snapshot.url, self._policy.allowed_domains):
             raise DomainRefused(
-                f"The browser navigated to {snapshot.url}, which this agent's "
-                f"allowed domains do not cover."
+                f"The browser navigated to {snapshot.url}, which this agent's allowed domains do not cover."
             )
         return snapshot
 
@@ -799,8 +797,7 @@ class CdpPage:
         """
         if not element.path:
             raise StaleElement(
-                f"The step chose {element.role}: {element.label}, which this "
-                f"page offers no way to address."
+                f"The step chose {element.role}: {element.label}, which this page offers no way to address."
             )
         # `%` formatting rather than an f-string: the selector is interpolated
         # into JavaScript, so it goes in as a JSON string literal and cannot
@@ -815,8 +812,7 @@ class CdpPage:
             )
         if not found.get("hit"):
             raise StaleElement(
-                f"Something is covering {element.role}: {element.label}; a click "
-                f"there would land on it instead."
+                f"Something is covering {element.role}: {element.label}; a click there would land on it instead."
             )
         moved_role = clean_label(str(found.get("role", "")))
         moved_label = clean_label(str(found.get("label", "")))
@@ -906,16 +902,14 @@ class CdpPage:
         """
         if element.role != "dropdown":
             raise StaleElement(
-                f"SELECT cannot be carried out on {element.role}: {element.label}, "
-                f"which is not a dropdown."
+                f"SELECT cannot be carried out on {element.role}: {element.label}, which is not a dropdown."
             )
         await self._locate(element)
         script = _SELECT_JS % {"path": json.dumps(element.path), "value": json.dumps(value)}
         answer = await self._evaluate(script)
         if not json.loads(str(answer.get("value") or "{}")).get("chosen"):
             raise StaleElement(
-                f"{element.label} has no option matching {value!r}; its choices "
-                f"are the ones listed with it."
+                f"{element.label} has no option matching {value!r}; its choices are the ones listed with it."
             )
 
     async def scroll(self, direction: str) -> None:  # pragma: no cover - needs a live browser
@@ -1059,7 +1053,21 @@ class CdpPage:
             session_id=self._session,
         )
         data = shot.get("data")
-        return f"data:image/jpeg;base64,{data}" if data else None
+        return self._picture(data) if data else None
+
+    def _picture(self, data: str) -> str:
+        """Map picture pixels using the frame Chromium actually produced.
+
+        captureScreenshot uses device pixels; startScreencast can use CSS pixels
+        or a smaller surface even at deviceScaleFactor=2. Reading only the JPEG
+        header avoids decoding or resampling the image on every frame.
+        """
+        with Image.open(BytesIO(b64decode(data))) as picture:
+            self._picture_scale = (
+                picture.width / self._width,
+                picture.height / self._height,
+            )
+        return f"data:image/jpeg;base64,{data}"
 
     @asynccontextmanager
     async def stream(  # pragma: no cover - needs a live browser
@@ -1098,7 +1106,7 @@ class CdpPage:
                     await self._client.send.Page.screencastFrameAck(
                         params={"sessionId": frame["sessionId"]}, session_id=self._session
                     )
-                    await deliver(f"data:image/jpeg;base64,{frame['data']}")
+                    await deliver(self._picture(frame["data"]))
                     await asyncio.sleep(STREAM_GAP)
             except (RuntimeError, ConnectionError, OSError) as stopped:
                 self._streaming = False
@@ -1106,7 +1114,7 @@ class CdpPage:
 
         self._client.register.Page.screencastFrame(on_frame)
         await self._client.send.Page.startScreencast(
-            params={"format": "jpeg", "quality": FRAME_QUALITY, "everyNthFrame": 1},
+            params={"format": "jpeg", "quality": 70, "everyNthFrame": 1},
             session_id=self._session,
         )
         task = asyncio.create_task(pump())
@@ -1129,16 +1137,16 @@ class CdpPage:
     ) -> None:
         """Press where a person clicked the picture, as a person holding the tab clicks.
 
-        The point arrives in the picture's own pixels, and a picture drawn for a
-        high-density screen has `scale` of them per CSS pixel the page is laid
-        out in.
+        The point arrives in the last picture's pixels. Its measured density
+        can differ from the requested device scale, especially for screencasts.
         """
+        scale_x, scale_y = self._picture_scale
         for event in ("mousePressed", "mouseReleased"):
             await self._client.send.Input.dispatchMouseEvent(
                 params={
                     "type": event,
-                    "x": x / self._scale,
-                    "y": y / self._scale,
+                    "x": x / scale_x,
+                    "y": y / scale_y,
                     "button": "left",
                     "clickCount": 1,
                 },
@@ -1348,6 +1356,7 @@ async def open_page(  # pragma: no cover - needs a live browser
     policy: PagePolicy,
     sign_ins: Sequence[SignIn] = (),
     route: BrowserRoute | None = None,
+    quick_start: bool = False,
 ) -> AsyncGenerator[CdpPage]:
     """Attach to a browser, open one tab on `start_url`, and close it again.
 
@@ -1496,7 +1505,16 @@ async def open_page(  # pragma: no cover - needs a live browser
                 params={"source": restore_script(list(sign_ins))}, session_id=session
             )
         page = CdpPage(client, session, policy, context_id=context_id or "")
-        await page.navigate(start_url)
+        if quick_start:
+            # A manually controlled sign-in must become interactive before a
+            # constantly updating login page finishes settling. The URL has
+            # already passed the same allowlist check as normal navigation;
+            # request interception and the isolated context remain in effect.
+            result = await client.send.Page.navigate(params={"url": start_url}, session_id=session)
+            if result.get("errorText"):
+                raise EndpointError("The browser could not load that address.")
+        else:
+            await page.navigate(start_url)
         yield page
     finally:
         if target is not None:
