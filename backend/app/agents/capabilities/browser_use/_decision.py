@@ -19,7 +19,7 @@ Nothing here reaches a browser; `_page.py` does that and hands a
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.agents.capabilities.browser_use._elements import Snapshot, render_table
 
@@ -133,7 +133,26 @@ class Step(BaseModel):
         )
     )
     next_goal: str = Field(description="What this step's action is for, in one sentence.")
-    action: Action
+    action: Action = Field(
+        description=(
+            'One action object with its required "action" tag, for example '
+            '{"action":"click","index":0} or {"action":"done","answer":"Observed result"}. '
+            'An object containing only "reason" is not an action.'
+        )
+    )
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _require_action_tag(cls, value: object) -> object:
+        if isinstance(value, dict) and "action" not in value:
+            raise ValueError(
+                'The action object needs an "action" tag: click, type, select, scroll, '
+                "navigate, back, wait, done, blocked, or ask_person. "
+                'To finish, return {"action":"done","answer":"Observed result"}. '
+                "A reason alone does not identify an action. Do not repeat an earlier "
+                "click or form submission just to correct this response."
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -156,6 +175,19 @@ INSTRUCTIONS = """\
 You operate a web browser to complete one task for somebody. Each step you are \
 shown the current page - its address, title, how far it is scrolled, a numbered \
 table of the elements you can act on, and its text - and you answer with one step.
+
+Response format:
+Return evaluation, memory, next_goal, and action. The action is an object with an \
+explicit "action" tag, even for terminal actions. For example:
+{"evaluation":"Start","memory":"","next_goal":"Open pricing",\
+"action":{"action":"click","index":0}}
+When the page confirms the requested result, finish with:
+{"evaluation":"The page confirms the result","memory":"","next_goal":"Finish",\
+"action":{"action":"done","answer":"The observed result"}}
+Never return an action containing only "reason". blocked and ask_person need both \
+"action" and "reason"; done needs both "action" and "answer". If a response is \
+rejected for its format, correct that response using the current observation; \
+do not repeat a previous click or submission to repair the format.
 
 Rules:
 - Choose exactly one action. Address an element only by its number in the \

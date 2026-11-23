@@ -9840,7 +9840,7 @@
       "done": "Tamamlandı",
       "blocked": "Sayfa tarafından engellendi",
       "exhausted": "Adım sınırında durdu",
-      "failed": "Browser'a erişilemedi"
+      "failed": "Browser görevi durdu"
     },
     "conversationActions": "Konuşma işlemleri",
     "imageNotLoaded": "Görsel (yüklenmedi)",

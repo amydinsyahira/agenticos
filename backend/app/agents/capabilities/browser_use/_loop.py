@@ -7,8 +7,8 @@ four ways a browse ends.
 
 **Four outcomes and no fifth.** `done` reached the goal. `blocked` is the model
 saying the page offers nothing that serves it. `exhausted` hit this call's step
-ceiling. `failed` is the browser or the endpoint. The distinction is the
-capability's point: a loop that can only succeed or time out reports a sign-in
+ceiling. `failed` is the browser, endpoint, or a model unable to choose a valid
+step. The distinction is the capability's point: a loop that can only succeed or time out reports a sign-in
 wall and a crashed browser identically, and a person reading the transcript
 cannot tell which one they need to fix.
 
@@ -34,6 +34,7 @@ from typing import Protocol
 
 import anyio
 import logfire
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 
 from app.agents.browser_events import (
     BrowseOutcome,
@@ -437,13 +438,34 @@ async def _drive(
                 )
             else:
                 kept.pending.clear()
-                step = await decide(
-                    task,
-                    snapshot,
-                    session.history,
-                    session.memory,
-                    image if policy.vision else None,
-                )
+                try:
+                    step = await decide(
+                        task,
+                        snapshot,
+                        session.history,
+                        session.memory,
+                        image if policy.vision else None,
+                    )
+                except UnexpectedModelBehavior:
+                    # Output retries already ran inside the stepper. Preserve the
+                    # tab and completed actions; replaying a form can duplicate it.
+                    reason = (
+                        "The browser AI could not produce a valid next step after its retries. "
+                        "Earlier actions may already have run; this does not confirm the task succeeded. "
+                        "Read the current page before continuing with direct browser tools, "
+                        "or let the person resume the session manually."
+                    )
+                    return await _finish(
+                        emit,
+                        session,
+                        call_id=call_id,
+                        outcome="failed",
+                        taken=taken,
+                        text=_remembered(session, reason),
+                        detail=reason,
+                        snapshot=snapshot,
+                        preview=preview,
+                    )
             clock.mark("decide")
             if control is not None:
                 waiting, resized = await between_steps(page, control)
