@@ -2198,7 +2198,7 @@
       "done": "Finished",
       "blocked": "Blocked by the page",
       "exhausted": "Stopped at the step limit",
-      "failed": "The browser could not be reached"
+      "failed": "The browser task stopped"
     },
     "conversationActions": "Conversation actions",
     "imageNotLoaded": "Image (not loaded)",

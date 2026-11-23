@@ -21,6 +21,8 @@ Two things are versioned separately from this file and worth knowing about:
 
 ### Fixed
 
+- Clarify browser step output and return malformed model decisions as failed browses with page context, without replaying prior actions or reporting Chromium as unreachable.
+
 - Map manual Live Browser clicks using the delivered image dimensions, so buttons remain clickable on high-density displays with CDP screencast and screenshot fallback.
 - Combine consecutive trackpad scroll commands while preserving clicks, hand-back order and the current holder's input boundary.
 - Show personal Sign-ins sessions immediately, start navigation without waiting for a full DOM snapshot, and use viewer-aware screencast with a screenshot fallback.

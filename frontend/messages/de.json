@@ -2198,7 +2198,7 @@
       "done": "Abgeschlossen",
       "blocked": "Von der Seite blockiert",
       "exhausted": "Beim Schrittlimit gestoppt",
-      "failed": "Der Browser war nicht erreichbar"
+      "failed": "Die Browseraufgabe wurde gestoppt"
     },
     "conversationActions": "Aktionen der Konversation",
     "imageNotLoaded": "Bild (nicht geladen)",

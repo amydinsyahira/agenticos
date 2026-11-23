@@ -1189,7 +1189,7 @@
       "done": "Zakończone",
       "blocked": "Strona zablokowała działanie",
       "exhausted": "Zatrzymane na limicie kroków",
-      "failed": "Nie udało się połączyć z przeglądarką"
+      "failed": "Zadanie w przeglądarce zostało zatrzymane"
     },
     "conversationActions": "Akcje konwersacji",
     "imageNotLoaded": "Obraz (niezaładowany)",

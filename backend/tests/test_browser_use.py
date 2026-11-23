@@ -613,6 +613,21 @@ class TestOneStep:
                 {"evaluation": "", "memory": "", "next_goal": "", "action": "click"}
             )
 
+    def test_a_reason_alone_gets_one_actionable_error_and_never_implies_done(self) -> None:
+        with pytest.raises(ValidationError) as failure:
+            Step.model_validate(
+                {
+                    "evaluation": "ok",
+                    "memory": "",
+                    "next_goal": "finish",
+                    "action": {"reason": "Task complete"},
+                }
+            )
+        errors = failure.value.errors(include_input=False)
+        assert len(errors) == 1
+        assert errors[0]["loc"] == ("action",)
+        assert '"action":"done"' in errors[0]["msg"]
+
     def test_the_step_schema_is_one_every_provider_accepts(self) -> None:
         """Anthropic's structured output refuses `oneOf`, which a discriminated union
         produces - every browse on Claude failed on its first step with a 400."""
@@ -1730,6 +1745,53 @@ class TestTheToolEndToEnd:
         answer = await _call(_toolset(_Opener()), model=model)
 
         assert answer.startswith("Finished: find the price")
+
+    async def test_an_untagged_terminal_response_can_be_corrected_without_repeating_a_click(
+        self,
+    ) -> None:
+        page = _FakePage(_snapshot(_element(0)))
+        model = _browsing_model(
+            _step_args({"action": "click", "index": 0}),
+            _step_args({"reason": "Task complete"}),
+            DONE_ARGS,
+        )
+        answer = await _call(_toolset(_Opener(page)), model=model)
+        assert answer.startswith("Finished:")
+        assert page.done.count("click:0") == 1
+
+    async def test_exhausted_model_output_retries_keep_the_page_and_actions_for_recovery(
+        self,
+    ) -> None:
+        frames = _Frames()
+        seen: list[Any] = []
+        page = _FakePage(_snapshot(_element(0)), text="Current page after submission")
+        opener = _Opener(page)
+        toolset = _toolset(opener)
+        model = _browsing_model(
+            _step_args({"action": "click", "index": 0}),
+            _step_args({"reason": "Task complete"}),
+            seen=seen,
+        )
+        async with toolset:
+            answer = await _call(toolset, model=model, sink=frames)
+            assert answer.startswith("The browse failed after 2 steps.")
+            assert "could not produce a valid next step" in answer
+            assert "Current page after submission" in answer
+            assert "does not confirm the task succeeded" in answer
+            assert len(seen) == 5  # One click decision, then four bounded output attempts.
+            assert page.done.count("click:0") == 1
+            assert opener.closed == 0
+            finished = frames.of("browser_finished")
+            assert len(finished) == 1
+            assert finished[0].outcome == "failed"
+            assert finished[0].url == "https://example.test/page"
+            assert "browser AI" in finished[0].detail
+            assert toolset.session is not None
+            assert len(toolset.session.history) == 1
+            resumed = await _call(toolset, {"task": "inspect the current result"})
+            assert resumed.startswith("Finished:")
+            assert len(opener.opened) == 1
+            assert page.done.count("click:0") == 1
 
     async def test_a_blocked_browse_says_so(self):
         blocked = _browsing_model(_step_args({"action": "blocked", "reason": "a sign-in"}))

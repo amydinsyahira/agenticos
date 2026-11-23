@@ -67,6 +67,15 @@ what was asked for - the model says so and the browse ends with an outcome a
 person can read. Four outcomes, no fifth: `done`, `blocked`, `exhausted`,
 `failed`.
 
+The step model has three output retries to correct a malformed decision. Each
+response must name an explicit action, including `done` with its `answer`; an
+unlabelled `reason` never implies success. If retries are exhausted, the browse
+returns `failed` with the current page and an explanation, keeping the tab and
+completed-action history for this run. The caller must inspect the page before
+continuing with direct tools or a person taking over; no earlier action is
+replayed to repair a model response. A model failure does not mean Chromium is
+unreachable.
+
 **One tab per run.** The toolset is entered by the run and keeps the tab between
 calls, so a second `browse_web` without `start_url` continues where the first
 stopped - signed in, half way through a form, with the model's memory - and the
